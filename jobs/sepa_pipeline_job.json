@@ -1,0 +1,146 @@
+{
+  "name": "uk_flood_sepa_monitoring_pipeline",
+  "description": "SEPA Scotland Real-Time Flood Monitoring pipeline: bronze scrape → silver normalise → gold catalog → download (skip) → raster ingest (skip). Runs every 4 hours. Covers Scottish Environment Protection Agency (SEPA) KiWIS river level/flow monitoring (~500 stations at 15-min cadence) and RSS flood warnings for Scotland.",
+  "tags": {
+    "project": "uk-flood",
+    "source": "sepa_monitoring",
+    "country": "scotland",
+    "layer": "medallion",
+    "api": "kiwis"
+  },
+  "schedule": {
+    "quartz_cron_expression": "0 0 */4 ? * *",
+    "timezone_id": "Europe/London",
+    "pause_status": "PAUSED"
+  },
+  "job_clusters": [
+    {
+      "job_cluster_key": "uk_flood_cluster",
+      "new_cluster": {
+        "spark_version": "17.3.x-scala2.13",
+        "node_type_id": "Standard_DS4_v2",
+        "autoscale": {
+          "min_workers": 2,
+          "max_workers": 4
+        },
+        "spark_conf": {
+          "spark.serializer": "org.apache.spark.serializer.KryoSerializer",
+          "spark.kryo.registrator": "org.apache.sedona.core.serde.SedonaKryoRegistrator"
+        },
+        "libraries": [
+          {
+            "maven": {
+              "coordinates": "org.apache.sedona:sedona-spark-shaded-4.0_2.13:1.8.1"
+            }
+          },
+          {
+            "maven": {
+              "coordinates": "org.datasyslab:geotools-wrapper:1.8.1-28.2"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "sepa_01_bronze_scrape",
+      "description": "Scrape SEPA KiWIS Time Series API: station list, 15-minute river level/flow readings (~500 stations), and RSS flood warnings. Writes to bronze Delta tables. KiWIS returns array-of-arrays format — parsed by sepa_kiwis_client pattern.",
+      "job_cluster_key": "uk_flood_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Users/kyle.ryan@mapguru.com/uk-flood/notebooks/sepa/sepa_01_bronze_scrape",
+        "base_parameters": {
+          "scrape_version": "1.0.0",
+          "period_hours": "4",
+          "max_ts_per_batch": "50"
+        }
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000
+    },
+    {
+      "task_key": "sepa_02_silver_normalize",
+      "description": "Normalise SEPA bronze records into silver tables: stations (MERGE on station_no), readings (append-only partitioned by reading_date), warnings (SCD Type 2 on warning_guid — tracks severity transitions).",
+      "depends_on": [
+        {"task_key": "sepa_01_bronze_scrape"}
+      ],
+      "job_cluster_key": "uk_flood_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Users/kyle.ryan@mapguru.com/uk-flood/notebooks/sepa/sepa_02_silver_normalize",
+        "base_parameters": {
+          "bronze_run_id": "{{tasks.sepa_01_bronze_scrape.values.run_id}}",
+          "full_refresh": "false"
+        }
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000
+    },
+    {
+      "task_key": "sepa_03_gold_catalog",
+      "description": "Build SEPA gold-layer catalogs: station catalog (with latest reading + active warning status), warning event history, and SEPA station summaries in the shared au_flood_report_index (_source='SEPA_SCOTLAND').",
+      "depends_on": [
+        {"task_key": "sepa_02_silver_normalize"}
+      ],
+      "job_cluster_key": "uk_flood_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Users/kyle.ryan@mapguru.com/uk-flood/notebooks/sepa/sepa_03_gold_catalog",
+        "base_parameters": {
+          "silver_run_id": "{{tasks.sepa_01_bronze_scrape.values.run_id}}",
+          "full_refresh": "false"
+        }
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000
+    },
+    {
+      "task_key": "sepa_04_download",
+      "description": "Download step — graceful skip. SEPA KiWIS API provides JSON monitoring data only; no bulk file attachments exist. SEPA flood risk spatial data is not publicly available (impact of December 2020 cyberattack). Placeholder for future spatial data when available.",
+      "depends_on": [
+        {"task_key": "sepa_03_gold_catalog"}
+      ],
+      "job_cluster_key": "uk_flood_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Users/kyle.ryan@mapguru.com/uk-flood/notebooks/sepa/sepa_04_download",
+        "base_parameters": {
+          "run_id": "{{tasks.sepa_01_bronze_scrape.values.run_id}}"
+        }
+      },
+      "timeout_seconds": 600,
+      "max_retries": 0,
+      "min_retry_interval_millis": 60000
+    },
+    {
+      "task_key": "sepa_05_raster_ingest",
+      "description": "Raster ingest — placeholder skip. SEPA does not publish flood risk raster data publicly (depth grids, hazard maps, risk surfaces). Root cause: December 2020 SEPA cyberattack destroyed data publication infrastructure. Monitor spatialdata.gov.scot and beta.sepa.scot for future availability. When available, implement using Apache Sedona RS_* functions with _source='SEPA_RISK'.",
+      "depends_on": [
+        {"task_key": "sepa_04_download"}
+      ],
+      "job_cluster_key": "uk_flood_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Users/kyle.ryan@mapguru.com/uk-flood/notebooks/sepa/sepa_05_raster_ingest",
+        "base_parameters": {
+          "run_id": "{{tasks.sepa_01_bronze_scrape.values.run_id}}"
+        }
+      },
+      "timeout_seconds": 600,
+      "max_retries": 0,
+      "min_retry_interval_millis": 60000
+    }
+  ],
+  "email_notifications": {
+    "on_failure": [
+      "kyle.ryan@mapguru.com"
+    ],
+    "no_alert_for_skipped_runs": true
+  },
+  "max_concurrent_runs": 1,
+  "parameters": [
+    {
+      "name": "scrape_version",
+      "default": "1.0.0"
+    }
+  ]
+}

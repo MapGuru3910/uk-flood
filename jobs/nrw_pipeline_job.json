@@ -1,0 +1,145 @@
+{
+  "name": "uk_flood_nrw_wales_pipeline",
+  "description": "NRW Wales Flood Risk Products pipeline: bronze WFS scrape → silver normalise (with Sedona ST_Transform BNG→WGS84) → gold catalog → download (skip) → raster ingest (skip). Runs weekly. Covers all 20 NRW flood layers from DataMapWales GeoServer WFS.",
+  "tags": {
+    "project": "uk-flood",
+    "source": "nrw_wales",
+    "country": "wales",
+    "layer": "medallion"
+  },
+  "schedule": {
+    "quartz_cron_expression": "0 0 2 ? * MON",
+    "timezone_id": "Europe/London",
+    "pause_status": "PAUSED"
+  },
+  "job_clusters": [
+    {
+      "job_cluster_key": "uk_flood_cluster",
+      "new_cluster": {
+        "spark_version": "17.3.x-scala2.13",
+        "node_type_id": "Standard_DS4_v2",
+        "autoscale": {
+          "min_workers": 2,
+          "max_workers": 6
+        },
+        "spark_conf": {
+          "spark.serializer": "org.apache.spark.serializer.KryoSerializer",
+          "spark.kryo.registrator": "org.apache.sedona.core.serde.SedonaKryoRegistrator"
+        },
+        "libraries": [
+          {
+            "maven": {
+              "coordinates": "org.apache.sedona:sedona-spark-shaded-4.0_2.13:1.8.1"
+            }
+          },
+          {
+            "maven": {
+              "coordinates": "org.datasyslab:geotools-wrapper:1.8.1-28.2"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "nrw_01_bronze_scrape",
+      "description": "Scrape all 20 NRW Wales WFS flood layers from DataMapWales GeoServer. Paginates using WFS 2.0.0 count/startIndex. Features stored with geometry_json (EPSG:27700 BNG) in bronze table.",
+      "job_cluster_key": "uk_flood_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Users/kyle.ryan@mapguru.com/uk-flood/notebooks/nrw/nrw_01_bronze_scrape",
+        "base_parameters": {
+          "scrape_version": "1.0.0",
+          "page_size": "5000",
+          "layer_filter": ""
+        }
+      },
+      "timeout_seconds": 14400,
+      "max_retries": 1,
+      "min_retry_interval_millis": 300000
+    },
+    {
+      "task_key": "nrw_02_silver_normalize",
+      "description": "Normalise NRW bronze WFS records into typed silver tables. Uses Sedona ST_GeomFromGeoJSON + ST_Transform to reproject from EPSG:27700 (BNG) to EPSG:4326 (WGS84). Stores bilingual fields (risk / risk_cy).",
+      "depends_on": [
+        {"task_key": "nrw_01_bronze_scrape"}
+      ],
+      "job_cluster_key": "uk_flood_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Users/kyle.ryan@mapguru.com/uk-flood/notebooks/nrw/nrw_02_silver_normalize",
+        "base_parameters": {
+          "bronze_run_id": "{{tasks.nrw_01_bronze_scrape.values.run_id}}",
+          "full_refresh": "false"
+        }
+      },
+      "timeout_seconds": 7200,
+      "max_retries": 1,
+      "min_retry_interval_millis": 120000
+    },
+    {
+      "task_key": "nrw_03_gold_catalog",
+      "description": "Build NRW Wales gold-layer catalogs: flood zone catalog (with EA-equivalent zone numbers), flood risk catalog (9 categories), and warning area catalog.",
+      "depends_on": [
+        {"task_key": "nrw_02_silver_normalize"}
+      ],
+      "job_cluster_key": "uk_flood_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Users/kyle.ryan@mapguru.com/uk-flood/notebooks/nrw/nrw_03_gold_catalog",
+        "base_parameters": {
+          "silver_run_id": "{{tasks.nrw_01_bronze_scrape.values.run_id}}",
+          "full_refresh": "false"
+        }
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000
+    },
+    {
+      "task_key": "nrw_04_download",
+      "description": "Download step — graceful skip. NRW Wales data is delivered via WFS inline GeoJSON — no bulk file downloads exist for this source.",
+      "depends_on": [
+        {"task_key": "nrw_03_gold_catalog"}
+      ],
+      "job_cluster_key": "uk_flood_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Users/kyle.ryan@mapguru.com/uk-flood/notebooks/nrw/nrw_04_download",
+        "base_parameters": {
+          "run_id": "{{tasks.nrw_01_bronze_scrape.values.run_id}}"
+        }
+      },
+      "timeout_seconds": 600,
+      "max_retries": 0,
+      "min_retry_interval_millis": 60000
+    },
+    {
+      "task_key": "nrw_05_raster_ingest",
+      "description": "Raster ingest — placeholder skip. NRW Wales publishes vector-only flood data via WFS. No raster products are available for Wales.",
+      "depends_on": [
+        {"task_key": "nrw_04_download"}
+      ],
+      "job_cluster_key": "uk_flood_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Users/kyle.ryan@mapguru.com/uk-flood/notebooks/nrw/nrw_05_raster_ingest",
+        "base_parameters": {
+          "run_id": "{{tasks.nrw_01_bronze_scrape.values.run_id}}"
+        }
+      },
+      "timeout_seconds": 600,
+      "max_retries": 0,
+      "min_retry_interval_millis": 60000
+    }
+  ],
+  "email_notifications": {
+    "on_failure": [
+      "kyle.ryan@mapguru.com"
+    ],
+    "no_alert_for_skipped_runs": true
+  },
+  "max_concurrent_runs": 1,
+  "parameters": [
+    {
+      "name": "scrape_version",
+      "default": "1.0.0"
+    }
+  ]
+}

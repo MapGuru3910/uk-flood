@@ -1,0 +1,145 @@
+{
+  "name": "uk_flood_ea_monitoring_pipeline",
+  "description": "EA Real-Time Flood Monitoring pipeline: bronze scrape → silver normalise → gold catalog → download (skip) → raster ingest (skip). Runs every 4 hours. Covers Environment Agency flood warnings, monitoring stations, flood areas, and latest readings for England.",
+  "tags": {
+    "project": "uk-flood",
+    "source": "ea_monitoring",
+    "country": "england",
+    "layer": "medallion"
+  },
+  "schedule": {
+    "quartz_cron_expression": "0 0 */4 ? * *",
+    "timezone_id": "Europe/London",
+    "pause_status": "PAUSED"
+  },
+  "job_clusters": [
+    {
+      "job_cluster_key": "uk_flood_cluster",
+      "new_cluster": {
+        "spark_version": "17.3.x-scala2.13",
+        "node_type_id": "Standard_DS4_v2",
+        "autoscale": {
+          "min_workers": 2,
+          "max_workers": 4
+        },
+        "spark_conf": {
+          "spark.serializer": "org.apache.spark.serializer.KryoSerializer",
+          "spark.kryo.registrator": "org.apache.sedona.core.serde.SedonaKryoRegistrator"
+        },
+        "libraries": [
+          {
+            "maven": {
+              "coordinates": "org.apache.sedona:sedona-spark-shaded-4.0_2.13:1.8.1"
+            }
+          },
+          {
+            "maven": {
+              "coordinates": "org.datasyslab:geotools-wrapper:1.8.1-28.2"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "ea_01_bronze_scrape",
+      "description": "Scrape EA Real-Time Flood Monitoring API: stations, flood warnings, flood areas, latest readings. Writes to bronze Delta tables.",
+      "job_cluster_key": "uk_flood_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Users/kyle.ryan@mapguru.com/uk-flood/notebooks/ea/ea_01_bronze_scrape",
+        "base_parameters": {
+          "scrape_version": "1.0.0",
+          "station_page_size": "500",
+          "flood_area_page_size": "500"
+        }
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000
+    },
+    {
+      "task_key": "ea_02_silver_normalize",
+      "description": "Normalise EA bronze records into silver tables: stations (MERGE), flood events (SCD2), flood areas (MERGE), readings (append).",
+      "depends_on": [
+        {"task_key": "ea_01_bronze_scrape"}
+      ],
+      "job_cluster_key": "uk_flood_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Users/kyle.ryan@mapguru.com/uk-flood/notebooks/ea/ea_02_silver_normalize",
+        "base_parameters": {
+          "bronze_run_id": "{{tasks.ea_01_bronze_scrape.values.run_id}}",
+          "full_refresh": "false"
+        }
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000
+    },
+    {
+      "task_key": "ea_03_gold_catalog",
+      "description": "Build EA gold-layer catalogs: station catalog (with latest reading + active warning status) and flood event history.",
+      "depends_on": [
+        {"task_key": "ea_02_silver_normalize"}
+      ],
+      "job_cluster_key": "uk_flood_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Users/kyle.ryan@mapguru.com/uk-flood/notebooks/ea/ea_03_gold_catalog",
+        "base_parameters": {
+          "silver_run_id": "{{tasks.ea_01_bronze_scrape.values.run_id}}",
+          "full_refresh": "false"
+        }
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000
+    },
+    {
+      "task_key": "ea_04_download",
+      "description": "Download step — graceful skip. EA Monitoring API provides JSON data only; no bulk file attachments exist for this source.",
+      "depends_on": [
+        {"task_key": "ea_03_gold_catalog"}
+      ],
+      "job_cluster_key": "uk_flood_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Users/kyle.ryan@mapguru.com/uk-flood/notebooks/ea/ea_04_download",
+        "base_parameters": {
+          "run_id": "{{tasks.ea_01_bronze_scrape.values.run_id}}"
+        }
+      },
+      "timeout_seconds": 600,
+      "max_retries": 0,
+      "min_retry_interval_millis": 60000
+    },
+    {
+      "task_key": "ea_05_raster_ingest",
+      "description": "Raster ingest — placeholder skip. EA Monitoring pipeline is vector/tabular only. Raster data handled by ea_depth pipeline.",
+      "depends_on": [
+        {"task_key": "ea_04_download"}
+      ],
+      "job_cluster_key": "uk_flood_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Users/kyle.ryan@mapguru.com/uk-flood/notebooks/ea/ea_05_raster_ingest",
+        "base_parameters": {
+          "run_id": "{{tasks.ea_01_bronze_scrape.values.run_id}}"
+        }
+      },
+      "timeout_seconds": 600,
+      "max_retries": 0,
+      "min_retry_interval_millis": 60000
+    }
+  ],
+  "email_notifications": {
+    "on_failure": [
+      "kyle.ryan@mapguru.com"
+    ],
+    "no_alert_for_skipped_runs": true
+  },
+  "max_concurrent_runs": 1,
+  "parameters": [
+    {
+      "name": "scrape_version",
+      "default": "1.0.0"
+    }
+  ]
+}
